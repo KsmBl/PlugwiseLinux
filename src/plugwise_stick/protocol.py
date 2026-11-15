@@ -23,6 +23,7 @@ FOOTER = b"\r\n"
 PULSES_PER_KW_SECOND = 468.9385193
 LOG_ADDR_OFFSET = 278528  # first energy-log memory address
 EMPTY_MACS = ("FFFFFFFFFFFFFFFF", "0000000000000000")
+LOG_ADDRESSES = 6016       # energy log ring buffer: addresses 0..6015, 4 entries each
 
 
 class Msg:
@@ -52,6 +53,9 @@ class Msg:
     RTC_REPLY = "003A"
     CLOCK_GET = "003E"
     CLOCK_REPLY = "003F"
+    ENERGY_LOG = "0048"         # read one log address (4 entries)
+    ENERGY_LOG_REPLY = "0049"
+    LOG_INTERVAL = "0057"       # set logging intervals
 
 
 class Ack:
@@ -65,11 +69,12 @@ class Ack:
     RTC_SET = "00DF"
     JOINING_ENABLED = "00D9"
     JOINING_DISABLED = "00DD"
+    LOG_INTERVAL_SET = "00F8"
     NAMES = {
         "00C1": "success", "00C2": "error", "00E1": "node did not respond",
         "00D8": "relay on", "00DE": "relay off", "00D7": "clock set",
         "00DF": "real-time clock set", "00D9": "joining enabled",
-        "00DD": "joining disabled",
+        "00DD": "joining disabled", "00F8": "log interval set",
     }
 
 
@@ -194,6 +199,8 @@ class PowerReading:
     watts_8s: float
     pulses_1s: int
     pulses_8s: int
+    pulses_this_hour: int | None = None    # consumed since the full hour
+    wh_this_hour: float | None = None
 
 
 @dataclass
@@ -258,7 +265,8 @@ def decode_calibration(p: str) -> Calibration:
                        hexfloat(p[32:40]), hexfloat(p[40:48]))
 
 
-def pulses_to_watts(pulses: int, seconds: int, cal: Calibration) -> float:
+def pulses_to_watts(pulses: int, seconds: float, cal: Calibration) -> float:
+    """Average power over `seconds` from a raw pulse count."""
     if pulses in (0, -1):           # -1 (0xFFFF) = not available
         return 0.0
     v = pulses / seconds + cal.off_noise
@@ -266,11 +274,58 @@ def pulses_to_watts(pulses: int, seconds: int, cal: Calibration) -> float:
     return max(corrected / seconds / PULSES_PER_KW_SECOND * 1000, 0.0)
 
 
+def pulses_to_wh(pulses: int, seconds: float, cal: Calibration) -> float:
+    """Energy (Wh) of `pulses` counted over `seconds`."""
+    return pulses_to_watts(abs(pulses), seconds, cal) * seconds / 3600
+
+
 def decode_power(p: str, cal: Calibration) -> PowerReading:
     # mac(16) pulses_1s(4) pulses_8s(4) [totals ...]
+    # mac(16) pulses_1s(4) pulses_8s(4) pulses_this_hour(8) produced_hour(8) ?(4)
     p1, p8 = sint(p[16:20]), sint(p[20:24])
+    hour = sint(p[24:32]) if len(p) >= 32 else None
+    wh = None
+    if hour is not None and hour >= 0:
+        now = datetime.now(timezone.utc)
+        elapsed = max(now.minute * 60 + now.second, 1)
+        wh = round(pulses_to_wh(hour, elapsed, cal), 3)
     return PowerReading(p[0:16], round(pulses_to_watts(p1, 1, cal), 2),
-                        round(pulses_to_watts(p8, 8, cal), 2), p1, p8)
+                        round(pulses_to_watts(p8, 8, cal), 2), p1, p8, hour, wh)
+
+
+@dataclass
+class LogEntry:
+    """One raw energy-log record: pulses counted in the interval ENDING at
+    `end`. Negative pulses are production (e.g. solar)."""
+    end: datetime
+    pulses: int
+
+
+def decode_log_time(s: str) -> datetime | None:
+    """year(2) month(2) minutes-of-month(4); FFFFFFFF/garbage -> None."""
+    if s == "FFFFFFFF":
+        return None
+    try:
+        return (datetime(2000 + int(s[0:2], 16), int(s[2:4], 16), 1, tzinfo=timezone.utc)
+                + timedelta(minutes=int(s[4:8], 16)))
+    except ValueError:
+        return None
+
+
+def decode_energy_log(p: str) -> tuple[int, list[LogEntry]]:
+    """0049: mac(16) 4 x [time(8) pulses(8)] logaddr(8) -> (index, entries)."""
+    entries = []
+    for i in range(4):
+        chunk = p[16 + 16 * i: 32 + 16 * i]
+        end = decode_log_time(chunk[0:8])
+        if end is not None:
+            entries.append(LogEntry(end, sint(chunk[8:16])))
+    index = (int(p[80:88], 16) - LOG_ADDR_OFFSET) // 32
+    return index, entries
+
+
+def log_address(index: int) -> str:
+    return f"{LOG_ADDR_OFFSET + 32 * (index % LOG_ADDRESSES):08X}"
 
 
 def decode_ping(p: str) -> PingResult:
@@ -303,6 +358,14 @@ def decode_rtc(p: str) -> RealTimeClock:
 
 
 # ---- payload encoders ------------------------------------------------------
+def encode_log_interval(mac: str, consumption_min: int, production_min: int) -> str:
+    """0057 payload: mac, consumption and production log interval (minutes)."""
+    for v in (consumption_min, production_min):
+        if not 1 <= v <= 0xFFFF:
+            raise PlugwiseError("log interval must be 1..65535 minutes")
+    return norm_mac(mac) + f"{consumption_min:04X}{production_min:04X}"
+
+
 def _utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         raise ValueError("datetime must be timezone-aware")

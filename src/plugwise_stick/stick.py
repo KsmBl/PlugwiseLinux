@@ -14,7 +14,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -38,6 +38,25 @@ class NodeStatus:
     watts: float | None = None
     clock: datetime | None = None
     error: str | None = None
+
+
+@dataclass
+class EnergyInterval:
+    """Energy measured by a plug in one log interval (start, end]."""
+    start: datetime
+    end: datetime
+    wh: float                    # consumed; production intervals are negative
+
+
+@dataclass
+class EnergyReport:
+    """Result of Stick.energy()."""
+    mac: str
+    since: datetime              # requested window start
+    intervals: list[EnergyInterval]
+    consumed_wh: float
+    produced_wh: float
+    interval_minutes: int | None # detected log interval
 
 
 @dataclass
@@ -327,6 +346,54 @@ class Stick:
                          final_acks=(Ack.RELAY_ON, Ack.RELAY_OFF), retries=retries)
         return r.payload[:4] == Ack.RELAY_ON
 
+    # ---- energy history ----------------------------------------------------
+    def read_log(self, mac: str, index: int, *,
+                 retries: int | None = None) -> list[P.LogEntry]:
+        """Raw entries of one energy-log address (up to 4 records)."""
+        r = self.request(Msg.ENERGY_LOG, norm_mac(mac) + P.log_address(index),
+                         Msg.ENERGY_LOG_REPLY, retries=retries)
+        return P.decode_energy_log(r.payload)[1]
+
+    def energy(self, mac: str, minutes: float = 60, *,
+               since: datetime | None = None) -> EnergyReport:
+        """Energy history stored on the plug for the last `minutes`
+        (or since `since`). Resolution = the plug's log interval (default
+        60 min; see set_log_interval()). Intervals that end inside the window
+        are included, so the first one may start slightly before it."""
+        mac = norm_mac(mac)
+        now = datetime.now(timezone.utc)
+        since = since or now - timedelta(minutes=minutes)
+        cal = self.calibration(mac)
+        last = self.info(mac).last_log_address
+        raw: list[P.LogEntry] = []
+        for n in range(P.LOG_ADDRESSES):
+            entries = self.read_log(mac, last - n)
+            if not entries:
+                if n == 0:
+                    continue        # pointer may sit on a fresh, empty address
+                break               # start of history
+            raw += entries
+            if min(e.end for e in entries) <= since:
+                break
+        # drop records outside the window and garbage from the future
+        raw = sorted({(e.end, e.pulses) for e in raw
+                      if since < e.end <= now + timedelta(minutes=2)})
+        intervals, step_min = _to_intervals(raw, cal)
+        return EnergyReport(
+            mac, since, intervals,
+            consumed_wh=round(sum(i.wh for i in intervals if i.wh > 0), 3),
+            produced_wh=round(-sum(i.wh for i in intervals if i.wh < 0), 3),
+            interval_minutes=step_min)
+
+    def set_log_interval(self, mac: str, consumption_minutes: int,
+                         production_minutes: int = 60) -> None:
+        """How often the plug writes an energy-log record (default 60 min).
+        Shorter intervals give finer history but the ring buffer
+        (6016 x 4 records) covers less time: 1 min = ~16 days, 60 min = ~2.7 years."""
+        self.request(Msg.LOG_INTERVAL,
+                     P.encode_log_interval(mac, consumption_minutes, production_minutes),
+                     final_acks=(Ack.LOG_INTERVAL_SET,))
+
     # ---- clocks ------------------------------------------------------------
     def get_clock(self, mac: str, *, retries: int | None = None) -> P.NodeClock:
         r = self.request(Msg.CLOCK_GET, norm_mac(mac), Msg.CLOCK_REPLY,
@@ -390,3 +457,26 @@ class Stick:
                 st.error = str(e)
             out.append(st)
         return out
+
+
+def _to_intervals(raw: list[tuple[datetime, int]],
+                  cal: P.Calibration) -> tuple[list[EnergyInterval], int | None]:
+    """Turn (end, pulses) records into intervals. Consumption (>= 0) and
+    production (< 0) records are separate series; each record covers the time
+    since the previous record of its series."""
+    out: list[EnergyInterval] = []
+    steps: list[float] = []
+    for series in ([r for r in raw if r[1] >= 0], [r for r in raw if r[1] < 0]):
+        diffs = [(b[0] - a[0]).total_seconds() for a, b in zip(series, series[1:])]
+        steps += diffs
+        default = min(diffs) if diffs else 3600.0
+        for i, (end, pulses) in enumerate(series):
+            secs = diffs[i - 1] if i > 0 else default
+            # a gap (e.g. plug unpowered) shouldn't stretch the interval
+            secs = min(secs, default) if default else secs
+            wh = P.pulses_to_wh(pulses, secs, cal)
+            out.append(EnergyInterval(end - timedelta(seconds=secs), end,
+                                      round(wh if pulses >= 0 else -wh, 4)))
+    out.sort(key=lambda i: (i.end, i.wh < 0))
+    step = int(min(steps) // 60) if steps else None
+    return out, step

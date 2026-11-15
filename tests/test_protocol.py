@@ -111,6 +111,42 @@ class TestDecoders(unittest.TestCase):
         self.assertEqual((r.rssi_in, r.rssi_out, r.ping_ms), (-73, -70, 69))
 
 
+class TestEnergyLog(unittest.TestCase):
+    # recorded 0049 payloads (2026-11-15)
+    GREY = ("000D6F0004465C941A0B52800000088A" + "F" * 48 + "00044000")
+    WHITE = ("000D6F0000D34169130B0011000000001A0B528000000000"
+             + "F" * 32 + "00044000")
+
+    def test_decode_grey_hourly_record(self):
+        idx, entries = P.decode_energy_log(self.GREY)
+        self.assertEqual(idx, 0)
+        self.assertEqual(entries, [P.LogEntry(
+            datetime(2026, 11, 15, 16, 0, tzinfo=timezone.utc), 2186)])
+
+    def test_decode_skips_empty_keeps_old(self):
+        _, entries = P.decode_energy_log(self.WHITE)
+        self.assertEqual([e.end.year for e in entries], [2019, 2026])
+
+    def test_log_address(self):
+        self.assertEqual(P.log_address(0), "00044000")
+        self.assertEqual(P.log_address(1), "00044020")
+        self.assertEqual(P.log_address(-1), P.log_address(P.LOG_ADDRESSES - 1))
+
+    def test_hour_energy(self):
+        # 2186 pulses in one hour -> 1.3 Wh with the grey plug's calibration
+        self.assertAlmostEqual(P.pulses_to_wh(2186, 3600, CAL), 1.3007, places=3)
+
+    def test_power_hour_counter(self):
+        r = P.decode_power("000D6F0004465C94000000040000020800000000000E", CAL)
+        self.assertEqual(r.pulses_this_hour, 520)
+        self.assertIsNotNone(r.wh_this_hour)
+
+    def test_log_interval_payload(self):
+        self.assertEqual(P.encode_log_interval(CIRCLE, 1, 60), CIRCLE + "0001003C")
+        with self.assertRaises(PlugwiseError):
+            P.encode_log_interval(CIRCLE, 0, 60)
+
+
 class TestEncoders(unittest.TestCase):
     DT = datetime(2026, 11, 15, 15, 31, 40, tzinfo=timezone.utc)  # a Sunday
 

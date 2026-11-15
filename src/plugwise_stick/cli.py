@@ -68,6 +68,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sync-clocks", aliases=["sync"],
                         help="set plug clocks (+ Circle+ RTC) to now")
     sp.add_argument("plug", nargs="*", help="default: all")
+    sp = sub.add_parser("energy", help="energy history stored on a plug")
+    sp.add_argument("plug")
+    sp.add_argument("-m", "--minutes", type=float, default=60,
+                    help="how far back (default 60)")
+    sp.add_argument("--hours", type=float, help="same, in hours")
+    sp = sub.add_parser("log-interval",
+                        help="set how often a plug logs energy (minutes, default 60)")
+    sp.add_argument("plug")
+    sp.add_argument("minutes", type=int)
+    sp.add_argument("--production", type=int, default=60,
+                    help="production (solar) log interval, minutes (default 60)")
     sp = sub.add_parser("remove", help="remove a node from the Circle+ table")
     sp.add_argument("plug")
     sp.add_argument("-y", "--yes", action="store_true", help="don't ask")
@@ -184,7 +195,32 @@ def main(argv=None) -> int:
                 out.obj(res, "\n".join(f"{label(m):16} {'ok' if e is None else e}"
                                        for m, e in res.items()))
                 return 0 if all(e is None for e in res.values()) else 1
-            elif a.cmd == "remove":
+            elif a.cmd == "energy":
+                mac = cfg.resolve(a.plug)
+                minutes = a.hours * 60 if a.hours else a.minutes
+                rep = s.energy(mac, minutes)
+                pw = s.power(mac)
+                lines = [f"{label(mac)}: last {minutes:g} min, log interval "
+                         + (f"{rep.interval_minutes} min" if rep.interval_minutes
+                            else "60 min (assumed, only one record)")]
+                lines += [f"  {i.start:%Y-%m-%d %H:%M} - {i.end:%H:%M} UTC  {i.wh:10.3f} Wh"
+                          for i in rep.intervals] or ["  (no records in this window)"]
+                lines.append(f"  total consumed {rep.consumed_wh:.3f} Wh"
+                             + (f", produced {rep.produced_wh:.3f} Wh" if rep.produced_wh else ""))
+                if pw.wh_this_hour is not None:
+                    lines.append(f"  this hour so far ({datetime.now(timezone.utc):%H}:00-now): "
+                                 f"{pw.wh_this_hour:.3f} Wh")
+                if (rep.interval_minutes or 60) >= 60 and minutes < 120:
+                    lines.append("  hint: for minute resolution run "
+                                 f"'plugwise log-interval {a.plug} 1'")
+                out.obj({**_plain(rep), "wh_this_hour": pw.wh_this_hour},
+                        "\n".join(lines))
+            elif a.cmd == "log-interval":
+                mac = cfg.resolve(a.plug)
+                s.set_log_interval(mac, a.minutes, a.production)
+                out.obj({"mac": mac, "consumption_minutes": a.minutes,
+                         "production_minutes": a.production},
+                        f"{label(mac)}: logging every {a.minutes} min")
                 mac = cfg.resolve(a.plug)
                 if not a.yes:
                     if not sys.stdin.isatty():

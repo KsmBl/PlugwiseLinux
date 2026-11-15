@@ -5,7 +5,8 @@
 ![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 
 **A Linux driver for Plugwise smart plugs: the USB Stick, Circle+ and Circle.**
-Switch plugs on and off, read live power usage and manage the plug network.
+Switch plugs on and off, read live power usage and the energy history
+stored on the plugs, and manage the plug network.
 Use it from the command line, from scripts (JSON output), or embed it as a
 Python library in your own smart-home software.
 
@@ -42,6 +43,7 @@ off
 - [Command reference](#command-reference)
 - [Using it as a library](#using-it-as-a-library)
 - [Integrating with other software](#integrating-with-other-software)
+- [Energy history](#energy-history)
 - [Pairing plugs](#pairing-plugs)
 - [Troubleshooting](#troubleshooting)
 - [Protocol notes](#protocol-notes)
@@ -147,6 +149,8 @@ a **unique MAC ending** of a named plug (`d34169`).
 | `status [--rescan]` | All plugs: online or offline, relay, watts, clock. `--rescan` re-reads the plug list first |
 | `on <plug>` / `off <plug>` | Switch the relay. Prints the state the plug reports back |
 | `power <plug>` | Current power in watts (1 s and 8 s averages, calibrated) |
+| `energy <plug> [-m MIN \| --hours H]` | Energy history stored on the plug (default: last 60 min) plus this hour so far. See [Energy history](#energy-history) |
+| `log-interval <plug> <MIN>` | How often the plug writes a history record (default 60, minimum 1) |
 | `watch [<plug>...] [-i SEC]` | Print power every few seconds. Default: all named plugs |
 | `info <plug>` | Type, firmware, hardware version, relay, mains frequency, clock |
 | `ping <plug>` | Signal strength (RSSI in and out) and round-trip time |
@@ -230,6 +234,9 @@ with Stick(node_cache="/var/lib/myapp/plugwise-nodes.json") as stick:
 | `remove(mac)` | `bool` |
 | `get_clock(mac)` / `set_clock(mac, dt=None)` | `NodeClock` / `None` |
 | `get_rtc()` / `set_rtc(dt=None)` | Circle+ real-time clock |
+| `energy(mac, minutes=60, since=None)` | `EnergyReport`: `intervals` (start, end, Wh), `consumed_wh`, `produced_wh`, `interval_minutes` |
+| `set_log_interval(mac, minutes, production_minutes=60)` | `None` |
+| `read_log(mac, index)` | raw `LogEntry` records of one log address |
 | `sync_clocks(macs=None)` | `{mac: None or error text}` |
 | `listen(seconds, ids=None)` | iterator of raw frames |
 
@@ -280,6 +287,39 @@ with Home Assistant's `command_line` integration, Node-RED's exec node, cron job
 and shell scripts. For continuous use, prefer a long-running process (the
 library, or `watch`), because every CLI call opens the port and initialises the
 stick again.
+
+## Energy history
+
+Every Circle stores its energy use in internal memory and keeps counting
+when the PC is off. The history survives as long as the plug's memory isn't
+overwritten.
+
+```
+$ plugwise energy white -m 5
+white: last 5 min, log interval 1 min
+  2026-11-15 16:17 - 16:18 UTC       0.412 Wh
+  2026-11-15 16:18 - 16:19 UTC       0.409 Wh
+  2026-11-15 16:19 - 16:20 UTC       0.415 Wh
+  2026-11-15 16:20 - 16:21 UTC       0.410 Wh
+  total consumed 1.646 Wh
+  this hour so far (16:00-now): 8.873 Wh
+
+$ plugwise energy grey --hours 24     # hourly records for the last day
+```
+
+- **Resolution.** By default a plug writes one record per **hour**, so a 60-minute
+  query returns the last full hour. For minute resolution, run
+  `plugwise log-interval <plug> 1` once. The plug then writes a record every minute.
+- **Coverage.** The log is a ring buffer of 24,064 records: about **16 days** at
+  1 minute, about **2.7 years** at 60 minutes. Older records are overwritten.
+- **This hour so far** comes from a live counter, separate from the log.
+- **Clocks.** Records are timestamped with the plug's clock. After a power loss
+  the clock restarts at 2000-01-01, so run `plugwise sync-clocks`. Records written
+  with a wrong clock are ignored.
+- **Solar.** On plugs that measure production, production records are reported
+  separately (`produced_wh`, negative Wh intervals).
+- Each query costs one radio request per 4 records: 60 minute-records take
+  about 1.5 s.
 
 ## Pairing plugs
 
@@ -346,6 +386,8 @@ from the plug follows with the same sequence number.
 | `0026` → `0027` | Calibration |
 | `0028` → ack `00DF` | Set Circle+ real-time clock |
 | `0029` → `003A` | Read Circle+ real-time clock |
+| `0048` → `0049` | Read one energy-log address (4 records) |
+| `0057` → ack `00F8` | Set log interval (consumption, production; minutes) |
 | `003E` → `003F` | Read clock |
 | `0008` → ack `00D9`/`00DD` | Allow / disallow joining |
 | `0006` (unsolicited) | Unpaired plug announces itself |
@@ -357,13 +399,18 @@ Power: pulses are corrected with the plug's calibration
 (`gain_a`, `gain_b`, `off_tot`, `off_noise`), then
 `watts = corrected pulses per second / 468.9385193 × 1000`.
 
+Energy log: a ring buffer of 6016 addresses × 4 records, starting at memory
+address `0x44000` with 32 bytes per address. Each record is
+`year(2) month(2) minutes-of-month(4) pulses(8, signed)`, timestamped at the
+end of its interval.
+
 Note that the Circle+ real-time clock stores its digits in decimal
 (`49` = 49 seconds), while everything else is plain hex.
 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -v     # 38 tests, about 0.05 s, no hardware needed
+python3 -m unittest discover -s tests -v     # 48 tests, about 0.05 s, no hardware needed
 ```
 
 ```
@@ -385,7 +432,7 @@ then as a method on `Stick`, then as a CLI command.
 
 ## Limitations and roadmap
 
-- [ ] Read the plugs' stored hourly energy history (kWh)
+- [x] Read the energy history stored on the plugs (hourly or per minute)
 - [ ] Background service exposing plugs via MQTT / Home Assistant discovery
 - [ ] Switch schedules (on the PC, or the Circles' built-in schedules)
 - [ ] Sense / Scan / Switch battery devices

@@ -4,7 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -34,6 +34,8 @@ class FakeStick:
         self.sent = []
         self.relay = {CP: True, CIRCLE: True}
         self.relay_timeouts = relay_timeouts   # first N relay requests time out
+        self.logs = {}            # mac -> {log index: [(time hex, pulses)]}
+        self.last_log = 0
 
     def _seq(self):
         self.seq += 1
@@ -59,7 +61,7 @@ class FakeStick:
             relay = "01" if self.relay[mac] else "00"
             typ = "01" if mac == CP else "02"
             self.out += ack("00C1") + fr(
-                f"0024{s}{mac}1A0B5000" + "00044000" + relay + "85"
+                f"0024{s}{mac}1A0B5000" + P.log_address(self.last_log) + relay + "85"
                 + "653907007330" + "4E0843A9" + typ)
         elif msg == "0026":
             self.out += ack("00C1") + fr(
@@ -78,6 +80,14 @@ class FakeStick:
             self.out += ack("00C1") + fr(f"0000{s}00D7{mac}")
         elif msg == "0028":
             self.out += ack("00C1") + fr(f"0000{s}00DF{mac}")
+        elif msg == "0048":
+            idx = (int(payload[16:24], 16) - P.LOG_ADDR_OFFSET) // 32
+            recs = self.logs.get(mac, {}).get(idx, [])
+            body = "".join(f"{t}{p & 0xFFFFFFFF:08X}" for t, p in recs)
+            body += "F" * (64 - len(body))
+            self.out += ack("00C1") + fr(f"0049{s}{mac}{body}{payload[16:24]}")
+        elif msg == "0057":
+            self.out += ack("00C1") + fr(f"0000{s}00F8{mac}")
         elif msg == "001C":
             self.out += ack("00C1") + fr(f"001D{s}{payload}01")
         else:
@@ -166,6 +176,53 @@ class TestStick(unittest.TestCase):
         self.assertEqual(fake.sent[-1], ("001C", CP + CIRCLE))
         with self.assertRaises(PlugwiseError):
             s.remove(CP)
+
+
+def logtime(dt):
+    minutes = (dt.day - 1) * 1440 + dt.hour * 60 + dt.minute
+    return f"{dt.year - 2000:02X}{dt.month:02X}{minutes:04X}"
+
+
+class TestEnergy(unittest.TestCase):
+    def test_minute_log_across_addresses(self):
+        s, fake = make()
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        recs = [(logtime(now - timedelta(minutes=m)), 100) for m in range(9, -1, -1)]
+        # 10 one-minute records over 3 addresses; pointer on the third
+        fake.logs[CIRCLE] = {5: recs[0:4], 6: recs[4:8], 7: recs[8:10]}
+        fake.last_log = 7
+        r = s.energy(CIRCLE, minutes=5.5)
+        self.assertEqual(r.interval_minutes, 1)
+        self.assertEqual(len(r.intervals), 6)          # ends at now-5 .. now
+        self.assertEqual(r.intervals[-1].end, now)
+        self.assertEqual(r.intervals[0].start, now - timedelta(minutes=6))
+        self.assertGreater(r.consumed_wh, 0)
+        reads = [p[16:24] for m, p in fake.sent if m == "0048"]
+        # reads newest-first and stops at the first address reaching past `since`
+        self.assertEqual(reads, [P.log_address(i) for i in (7, 6, 5)])
+
+    def test_stops_at_start_of_history_and_skips_garbage(self):
+        s, fake = make()
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        fake.logs[CIRCLE] = {0: [("130B0011", 0), (logtime(now), 2186)]}
+        r = s.energy(CIRCLE, minutes=600)
+        self.assertEqual([i.end for i in r.intervals], [now])
+        self.assertAlmostEqual(r.consumed_wh, 1.30, places=2)
+
+    def test_production_is_separate(self):
+        s, fake = make()
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        fake.logs[CIRCLE] = {0: [(logtime(now - timedelta(hours=1)), 2186),
+                                 (logtime(now - timedelta(hours=1)), -2186),
+                                 (logtime(now), 2186), (logtime(now), -2186)]}
+        r = s.energy(CIRCLE, minutes=180)
+        self.assertAlmostEqual(r.consumed_wh, 2.6, places=1)
+        self.assertAlmostEqual(r.produced_wh, 2.6, places=1)
+
+    def test_set_log_interval(self):
+        s, fake = make()
+        s.set_log_interval(CIRCLE, 1)
+        self.assertEqual(fake.sent[-1], ("0057", CIRCLE + "0001003C"))
 
 
 class TestNodeCache(unittest.TestCase):
