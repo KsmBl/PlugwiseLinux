@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from plugwise_stick import Config, NodeTimeout, PlugwiseError, Stick  # noqa: E402
 from plugwise_stick import protocol as P  # noqa: E402
+from plugwise_stick.cache import NodeCache  # noqa: E402
 
 STICK = "000D6F0003C9E1C1"
 CP = "000D6F0004465C94"
@@ -164,6 +165,74 @@ class TestStick(unittest.TestCase):
         self.assertEqual(fake.sent[-1], ("001C", CP + CIRCLE))
         with self.assertRaises(PlugwiseError):
             s.remove(CP)
+
+
+class TestNodeCache(unittest.TestCase):
+    GONE = "000D6F0000AAAAAA"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "nodes.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def stick(self):
+        fake = FakeStick()
+        s = Stick(transport=fake, timeout=0.3, retry_delay=0, node_cache=self.path)
+        s.connect()
+        return s, fake
+
+    @staticmethod
+    def table_requests(fake):
+        return sum(1 for m, _ in fake.sent if m == "0018")
+
+    def test_table_read_once_then_cached_across_instances(self):
+        s, fake = self.stick()
+        self.assertEqual(s.table(), [(0, OLD), (1, CIRCLE)])
+        self.assertEqual(self.table_requests(fake), 64)
+        s.table()
+        self.assertEqual(self.table_requests(fake), 64)       # memory
+        s2, fake2 = self.stick()
+        self.assertEqual(s2.table(), [(0, OLD), (1, CIRCLE)])
+        self.assertEqual(self.table_requests(fake2), 0)       # disk cache
+
+    def test_status_uses_cache_unless_refresh(self):
+        s, fake = self.stick()
+        s.table()
+        s.status()
+        self.assertEqual(self.table_requests(fake), 64)
+        s.status(refresh=True)
+        self.assertEqual(self.table_requests(fake), 128)
+
+    def test_cache_of_other_network_ignored(self):
+        NodeCache(self.path).save("000D6F0000BBBBBB", [(3, self.GONE)])
+        s, fake = self.stick()
+        self.assertEqual(s.table(), [(0, OLD), (1, CIRCLE)])
+        self.assertEqual(self.table_requests(fake), 64)
+
+    def test_first_sync(self):
+        s, _ = self.stick()
+        d = s.sync_nodes()
+        self.assertTrue(d.first_sync)
+        self.assertEqual((d.added, d.removed), ([], []))
+        self.assertEqual(d.nodes, [(0, OLD), (1, CIRCLE)])
+
+    def test_sync_reports_changes(self):
+        NodeCache(self.path).save(CP, [(1, CIRCLE), (7, self.GONE)])
+        s, fake = self.stick()
+        d = s.sync_nodes()
+        self.assertFalse(d.first_sync)
+        self.assertEqual(d.added, [(0, OLD)])
+        self.assertEqual(d.removed, [(7, self.GONE)])
+        self.assertEqual(NodeCache(self.path).load(CP), [(0, OLD), (1, CIRCLE)])
+
+    def test_remove_updates_cache_without_rescan(self):
+        s, fake = self.stick()
+        s.table()
+        self.assertTrue(s.remove(OLD))
+        self.assertEqual(NodeCache(self.path).load(CP), [(1, CIRCLE)])
+        self.assertEqual(self.table_requests(fake), 64)
 
 
 class TestConfig(unittest.TestCase):

@@ -14,9 +14,11 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Iterator
 
 from . import protocol as P
+from .cache import NodeCache
 from .errors import NodeTimeout, PlugwiseError, StickError
 from .protocol import Ack, Msg, norm_mac
 from .transport import SerialTransport
@@ -37,14 +39,28 @@ class NodeStatus:
     error: str | None = None
 
 
+@dataclass
+class TableDiff:
+    """Result of Stick.sync_nodes()."""
+    nodes: list[tuple[int, str]]          # current table (slot, mac)
+    added: list[tuple[int, str]]
+    removed: list[tuple[int, str]]
+    first_sync: bool                      # no previous copy to compare with
+
+
 class Stick:
     def __init__(self, port: str | None = None, *, transport=None,
-                 retries: int = 3, timeout: float = 5.0, retry_delay: float = 2.0):
+                 retries: int = 3, timeout: float = 5.0, retry_delay: float = 2.0,
+                 node_cache: str | Path | None = None):
         """port: serial device (auto-detected if None).
         transport: any object with write/read/close (overrides port; for tests).
         retries: how often to retry when a node doesn't answer.
+        node_cache: JSON file to persist the Circle+ node table in (reading
+            it from the Circle+ takes 5-12 s). None = keep it in memory only.
         """
         self.transport = transport or SerialTransport(port)
+        self._cache = NodeCache(node_cache) if node_cache else None
+        self._table: list[tuple[int, str]] | None = None
         self.retries = retries
         self.timeout = timeout
         self.retry_delay = retry_delay
@@ -155,8 +171,8 @@ class Stick:
             raise PlugwiseError("Plugwise network is offline (no Circle+ paired)")
         return self.info_cache.circle_plus_mac
 
-    def table(self) -> list[tuple[int, str]]:
-        """Nodes registered in the Circle+ table as (slot, mac)."""
+    def read_table(self) -> list[tuple[int, str]]:
+        """Read the node table from the Circle+ itself (64 requests, slow)."""
         cp = self.circle_plus
         nodes = []
         for slot in range(64):
@@ -167,9 +183,45 @@ class Stick:
                 nodes.append((slot, mac))
         return nodes
 
-    def nodes(self) -> list[str]:
+    def table(self, refresh: bool = False) -> list[tuple[int, str]]:
+        """Nodes registered in the Circle+ as (slot, mac).
+
+        Served from memory / the node cache when available; refresh=True
+        (or a missing cache) reads it from the Circle+ and updates the cache.
+        """
+        if not refresh and (known := self._known_table()) is not None:
+            return known
+        self._set_table(self.read_table())
+        return list(self._table)
+
+    def _known_table(self) -> list[tuple[int, str]] | None:
+        """Table from memory or cache, without touching the radio."""
+        if self._table is None and self._cache:
+            self._table = self._cache.load(self.circle_plus)
+        return None if self._table is None else list(self._table)
+
+    def _set_table(self, nodes: list[tuple[int, str]]) -> None:
+        self._table = sorted(nodes)
+        if self._cache:
+            self._cache.save(self.circle_plus, self._table)
+
+    def sync_nodes(self) -> TableDiff:
+        """Re-read the node table from the Circle+ and update the cache.
+        Returns what changed compared to the previously known table."""
+        old = self._known_table()
+        new = self.table(refresh=True)
+        old_macs = {m for _, m in old or []}
+        new_macs = {m for _, m in new}
+        return TableDiff(
+            nodes=new,
+            added=[(s, m) for s, m in new if old is not None and m not in old_macs],
+            removed=[(s, m) for s, m in old or [] if m not in new_macs],
+            first_sync=old is None,
+        )
+
+    def nodes(self, refresh: bool = False) -> list[str]:
         """All known node MACs: Circle+ first, then the table."""
-        return [self.circle_plus] + [m for _, m in self.table()]
+        return [self.circle_plus] + [m for _, m in self.table(refresh)]
 
     def remove(self, mac: str) -> bool:
         """Remove a node from the Circle+ table. Returns True on success."""
@@ -180,7 +232,10 @@ class Stick:
                          reply_id=Msg.NODE_REMOVE_REPLY)
         removed_mac, ok = P.decode_node_remove(r.payload)
         self._cal.pop(mac, None)
-        return ok and removed_mac == mac
+        ok = ok and removed_mac == mac
+        if ok and (known := self._known_table()) is not None:
+            self._set_table([(s, m) for s, m in known if m != mac])
+        return ok
 
     # ---- joining -----------------------------------------------------------
     def allow_joining(self, enable: bool) -> None:
@@ -237,6 +292,8 @@ class Stick:
                     break
         finally:
             self.allow_joining(False)
+        if joined:  # new nodes got slots we don't know: re-read the table
+            self.table(refresh=True)
         return joined
 
     # ---- per node ----------------------------------------------------------
@@ -310,19 +367,21 @@ class Stick:
         return result
 
     # ---- overview ----------------------------------------------------------
-    def status(self, macs: list[str] | None = None) -> list[NodeStatus]:
+    def status(self, macs: list[str] | None = None, *,
+               refresh: bool = False) -> list[NodeStatus]:
         """Online/relay/power summary for all (or the given) nodes.
-        Offline nodes are tried only once, to keep this fast."""
+        Offline nodes are tried only once, to keep this fast.
+        refresh=True re-reads the node table from the Circle+ first."""
         slots = {}
         if macs is None:
-            table = self.table()
+            table = self.table(refresh)
             slots = {m: s for s, m in table}
             macs = [self.circle_plus] + [m for _, m in table]
         out = []
         for mac in map(norm_mac, macs):
             st = NodeStatus(mac=mac, slot=slots.get(mac), online=False)
             try:
-                inf = self.info(mac, retries=1)
+                inf = self.info(mac, retries=0)
                 st.online, st.node_type = True, inf.node_type
                 st.relay_on, st.clock = inf.relay_on, inf.clock
                 st.watts = self.power(mac, retries=1).watts_8s

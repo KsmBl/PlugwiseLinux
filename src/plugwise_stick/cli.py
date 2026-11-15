@@ -10,6 +10,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from .cache import default_path as cache_path
 from .config import Config
 from .errors import PlugwiseError
 from .stick import Stick
@@ -41,6 +42,9 @@ class Output:
                 print(f"{k:18} {v}")
 
 
+ALIASES = {"scan": "sync-nodes", "sync": "sync-clocks"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="plugwise", description=__doc__)
     ap.add_argument("-p", "--port", help="serial port (default: auto-detect)")
@@ -51,14 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
 
     sub.add_parser("stick", help="stick and network info")
-    sub.add_parser("scan", help="list nodes registered in the Circle+")
-    sub.add_parser("status", help="overview of all plugs")
+    sub.add_parser("sync-nodes", aliases=["scan"],
+                   help="re-read the plug list from the Circle+, show changes")
+    sub.add_parser("status", help="overview of all plugs").add_argument(
+        "--rescan", action="store_true", help="re-read the plug list first")
     for name, h in [("info", "node info"), ("ping", "ping a plug"),
                     ("cal", "calibration data"), ("power", "current power (W)"),
                     ("on", "switch relay on"), ("off", "switch relay off"),
                     ("clock", "show a plug's clock")]:
         sub.add_parser(name, help=h).add_argument("plug")
-    sp = sub.add_parser("sync", help="set plug clocks (+ Circle+ RTC) to now")
+    sp = sub.add_parser("sync-clocks", aliases=["sync"],
+                        help="set plug clocks (+ Circle+ RTC) to now")
     sp.add_argument("plug", nargs="*", help="default: all")
     sp = sub.add_parser("remove", help="remove a node from the Circle+ table")
     sp.add_argument("plug")
@@ -83,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
+    a.cmd = ALIASES.get(a.cmd, a.cmd)
     logging.basicConfig(level=logging.DEBUG if a.debug else logging.WARNING,
                         format="[%(levelname)s] %(message)s", stream=sys.stderr)
     out = Output(a.json)
@@ -105,20 +113,37 @@ def main(argv=None) -> int:
             out.obj(cfg.names, f"saved to {cfg.path}")
             return 0
 
-        with Stick(a.port or cfg.port) as s:
+        with Stick(a.port or cfg.port, node_cache=cache_path()) as s:
             net = s.connect()
             if a.cmd == "stick":
                 out.obj(net)
-            elif a.cmd == "scan":
-                table = s.table()
+            elif a.cmd == "sync-nodes":
+                diff = s.sync_nodes()
+                present = {s.circle_plus} | {m for _, m in diff.nodes}
+                stale = {n: m for n, m in cfg.names.items() if m not in present}
+                unnamed = [m for m in sorted(present) if not cfg.name_of(m)]
+                lines = [f"Circle+  {s.circle_plus}  {cfg.name_of(s.circle_plus) or ''}"]
+                lines += [f"slot {i:2d}  {m}  {cfg.name_of(m) or ''}"
+                          for i, m in diff.nodes]
+                if diff.first_sync:
+                    lines.append("(first sync: plug list saved)")
+                elif not (diff.added or diff.removed):
+                    lines.append("no changes")
+                lines += [f"+ added    slot {i:2d}  {m}" for i, m in diff.added]
+                lines += [f"- removed  slot {i:2d}  {label(m)}" for i, m in diff.removed]
+                lines += [f"! name '{n}' -> {m} is not in this network "
+                          f"(plugwise name --delete {n})" for n, m in stale.items()]
+                lines += [f"? unnamed  {m}  (plugwise name {m} <name>)" for m in unnamed]
                 out.obj({"circle_plus": s.circle_plus,
                          "nodes": [{"slot": i, "mac": m, "name": cfg.name_of(m)}
-                                   for i, m in table]},
-                        "\n".join([f"Circle+  {s.circle_plus}  {cfg.name_of(s.circle_plus) or ''}"]
-                                  + [f"slot {i:2d}  {m}  {cfg.name_of(m) or ''}"
-                                     for i, m in table]))
+                                   for i, m in diff.nodes],
+                         "added": [m for _, m in diff.added],
+                         "removed": [m for _, m in diff.removed],
+                         "first_sync": diff.first_sync,
+                         "stale_names": stale, "unnamed": unnamed},
+                        "\n".join(lines))
             elif a.cmd == "status":
-                rows = s.status()
+                rows = s.status(refresh=a.rescan)
                 data = [{**_plain(r), "name": cfg.name_of(r.mac)} for r in rows]
                 lines = [f"{'NAME':12} {'MAC':16} {'TYPE':8} {'STATE':7} "
                          f"{'RELAY':5} {'POWER':>9}  CLOCK (UTC)"]
@@ -152,7 +177,7 @@ def main(argv=None) -> int:
                 if mac == s.circle_plus:
                     d["rtc"] = s.get_rtc().time
                 out.obj(d)
-            elif a.cmd == "sync":
+            elif a.cmd == "sync-clocks":
                 macs = [cfg.resolve(p) for p in a.plug] or None
                 res = s.sync_clocks(macs)
                 out.obj(res, "\n".join(f"{label(m):16} {'ok' if e is None else e}"
