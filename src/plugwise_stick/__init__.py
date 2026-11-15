@@ -7,7 +7,7 @@ from .protocol import (Calibration, NodeClock, NodeInfo, PingResult,
 from .stick import EnergyInterval, EnergyReport, NodeStatus, Stick, TableDiff
 from .transport import SerialTransport, find_port
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "Stick", "Config", "SerialTransport", "find_port",
     "PlugwiseError", "StickError", "NodeTimeout",
