@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Persistent copy of the Circle+ node table.
 
 Reading the table from the Circle+ takes 64 radio round trips (5-12 s), and it

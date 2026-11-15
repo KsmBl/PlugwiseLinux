@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Friendly names for plugs, stored in ~/.config/plugwise/config.toml:
 
     port = "/dev/plugwise"          # optional

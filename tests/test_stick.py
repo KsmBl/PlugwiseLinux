@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Stick request/response logic against a scripted fake transport."""
 import os
 import sys

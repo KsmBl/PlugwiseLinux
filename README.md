@@ -1,5 +1,9 @@
 # PlugwiseLinux
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
+![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+
 **A Linux driver for Plugwise smart plugs: the USB Stick, Circle+ and Circle.**
 Switch plugs on and off, read live power usage and manage the plug network.
 Use it from the command line, from scripts (JSON output), or embed it as a
@@ -386,6 +390,12 @@ then as a method on `Stick`, then as a CLI command.
 - [ ] Switch schedules (on the PC, or the Circles' built-in schedules)
 - [ ] Sense / Scan / Switch battery devices
 - [ ] Power production (solar) counters
+
+## License
+
+[GPL-3.0-or-later](LICENSE). You may use, modify and sell software built
+with this project, but anything you distribute that includes it must also be
+released as open source under the GPL, with its full source code.
 
 ## Disclaimer
 

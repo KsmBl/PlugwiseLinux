@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Protocol codec tests, using frames recorded from real hardware (2026-11-15)."""
 import os
 import sys

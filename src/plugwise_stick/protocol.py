@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Plugwise USB protocol: framing, CRC, message ids and payload codecs.
 
 Pure functions only (no I/O), so everything here is unit-testable.

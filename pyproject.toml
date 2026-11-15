@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,19 @@ version = "0.2.0"
 description = "Linux userspace driver for Plugwise Stick, Circle+ and Circle"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["plugwise", "smart-home", "home-automation", "zigbee", "smart-plug", "energy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Home Automation",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/KsmBl/PlugwiseLinux"
 
 [project.scripts]
 plugwise = "plugwise_stick.cli:main"

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Linux userspace driver for Plugwise Stick, Circle+ and Circle."""
 from .config import Config
 from .errors import NodeTimeout, PlugwiseError, StickError

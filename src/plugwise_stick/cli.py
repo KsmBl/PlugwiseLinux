@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Command-line front-end. Plugs can be given by name, full MAC, or a unique
 MAC suffix of a named plug. Use --json for machine-readable output."""
 from __future__ import annotations

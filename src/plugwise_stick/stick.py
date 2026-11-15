@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """High-level, thread-safe API for a Plugwise Stick and its Circles.
 
 Example:

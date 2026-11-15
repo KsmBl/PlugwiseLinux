@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Run the CLI from a source checkout without installing: ./plugwise.py ..."""
 import os
 import sys

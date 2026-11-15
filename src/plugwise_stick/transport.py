@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Byte transports. The Stick only needs write(bytes) / read(timeout) / close()."""
 from __future__ import annotations
 
