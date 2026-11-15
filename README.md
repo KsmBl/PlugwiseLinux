@@ -410,7 +410,7 @@ Note that the Circle+ real-time clock stores its digits in decimal
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -v     # 48 tests, about 0.05 s, no hardware needed
+python3 -m unittest discover -s tests -v     # 52 tests, about 0.1 s, no hardware needed
 ```
 
 ```
@@ -425,6 +425,7 @@ src/plugwise_stick/
 tests/
   test_protocol.py              codecs, against frames recorded from real devices
   test_stick.py                 request logic, retries, cache, against a fake stick
+  test_cli.py                   every command sends only the messages it should
 ```
 
 New message types go in `protocol.py` (decoder plus a test with a recorded frame),

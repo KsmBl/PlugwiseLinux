@@ -221,6 +221,7 @@ def main(argv=None) -> int:
                 out.obj({"mac": mac, "consumption_minutes": a.minutes,
                          "production_minutes": a.production},
                         f"{label(mac)}: logging every {a.minutes} min")
+            elif a.cmd == "remove":
                 mac = cfg.resolve(a.plug)
                 if not a.yes:
                     if not sys.stdin.isatty():

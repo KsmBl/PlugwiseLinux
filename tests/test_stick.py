@@ -86,6 +86,12 @@ class FakeStick:
             body = "".join(f"{t}{p & 0xFFFFFFFF:08X}" for t, p in recs)
             body += "F" * (64 - len(body))
             self.out += ack("00C1") + fr(f"0049{s}{mac}{body}{payload[16:24]}")
+        elif msg == "000D":
+            self.out += ack("00C1") + fr(f"000E{s}{mac}B7BA0045")
+        elif msg == "003E":
+            self.out += ack("00C1") + fr(f"003F{s}{mac}0F1F28060000")
+        elif msg == "0029":
+            self.out += ack("00C1") + fr(f"003A{s}{mac}40311506151126")
         elif msg == "0057":
             self.out += ack("00C1") + fr(f"0000{s}00F8{mac}")
         elif msg == "001C":
