@@ -1,0 +1,332 @@
+"""High-level, thread-safe API for a Plugwise Stick and its Circles.
+
+Example:
+    from plugwise_stick import Stick
+    with Stick() as stick:
+        net = stick.connect()
+        stick.switch("000D6F0000D34169", on=True)
+        print(stick.power("000D6F0000D34169").watts_8s)
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Iterator
+
+from . import protocol as P
+from .errors import NodeTimeout, PlugwiseError, StickError
+from .protocol import Ack, Msg, norm_mac
+from .transport import SerialTransport
+
+log = logging.getLogger("plugwise_stick")
+
+
+@dataclass
+class NodeStatus:
+    """Summary of one node, as returned by Stick.status()."""
+    mac: str
+    slot: int | None             # Circle+ table slot (None for the Circle+)
+    online: bool
+    node_type: str | None = None
+    relay_on: bool | None = None
+    watts: float | None = None
+    clock: datetime | None = None
+    error: str | None = None
+
+
+class Stick:
+    def __init__(self, port: str | None = None, *, transport=None,
+                 retries: int = 3, timeout: float = 5.0, retry_delay: float = 2.0):
+        """port: serial device (auto-detected if None).
+        transport: any object with write/read/close (overrides port; for tests).
+        retries: how often to retry when a node doesn't answer.
+        """
+        self.transport = transport or SerialTransport(port)
+        self.retries = retries
+        self.timeout = timeout
+        self.retry_delay = retry_delay
+        self.info_cache: P.StickInfo | None = None
+        self._cal: dict[str, P.Calibration] = {}
+        self._pending: list[P.Frame] = []
+        self._parser = P.FrameParser(
+            on_noise=lambda line, why: log.debug("<< (%s) %r", why, line))
+        self._lock = threading.RLock()
+
+    # ---- lifecycle ---------------------------------------------------------
+    def close(self):
+        self.transport.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # ---- low level ---------------------------------------------------------
+    def send(self, msg_id: str, payload: str = "") -> None:
+        frame = P.build_frame(msg_id, payload)
+        log.debug(">> %r", frame)
+        self.transport.write(frame)
+
+    def _pump(self, timeout: float) -> None:
+        data = self.transport.read(timeout)
+        if data:
+            for f in self._parser.feed(data):
+                log.debug("<< %s", f)
+                self._pending.append(f)
+
+    def wait_for(self, pred: Callable[[P.Frame], bool],
+                 timeout: float) -> P.Frame | None:
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, f in enumerate(self._pending):
+                if pred(f):
+                    return self._pending.pop(i)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            self._pump(min(left, 0.2))
+
+    def _request_once(self, msg_id: str, payload: str, reply_id: str | None,
+                      final_acks: tuple[str, ...]) -> P.Frame:
+        self._pending.clear()
+        self.send(msg_id, payload)
+        ack = self.wait_for(lambda f: f.id == Msg.ACK, self.timeout)
+        if ack is None:
+            raise StickError(f"no ack from stick for {msg_id}")
+        code = ack.payload[:4]
+        if code == Ack.ERROR:
+            raise StickError(f"stick reported error for {msg_id}")
+        if code == Ack.TIMEOUT:
+            raise NodeTimeout("node did not respond")
+        if reply_id is None and not final_acks:
+            return ack
+        if code in final_acks:
+            return ack
+        seq = ack.seq
+        while True:
+            f = self.wait_for(lambda f: f.seq == seq, self.timeout)
+            if f is None:
+                raise NodeTimeout(f"no reply to {msg_id}")
+            if f.id == Msg.ACK:
+                c = f.payload[:4]
+                if c == Ack.TIMEOUT:
+                    raise NodeTimeout("node did not respond")
+                if c in final_acks:
+                    return f
+                continue
+            if f.id == reply_id:
+                return f
+
+    def request(self, msg_id: str, payload: str = "", reply_id: str | None = None,
+                *, final_acks: tuple[str, ...] = (), retries: int | None = None) -> P.Frame:
+        """Send a request and return the reply frame (or the final ack).
+
+        Retries on NodeTimeout: the mesh may be re-routing, e.g. after a
+        Circle that relayed traffic lost power.
+        """
+        retries = self.retries if retries is None else retries
+        with self._lock:
+            for attempt in range(retries + 1):
+                try:
+                    return self._request_once(msg_id, payload, reply_id, final_acks)
+                except NodeTimeout:
+                    if attempt == retries:
+                        raise
+                    log.debug("node timeout, retry %d/%d", attempt + 1, retries)
+                    time.sleep(self.retry_delay * (attempt + 1))
+        raise AssertionError("unreachable")
+
+    # ---- stick / network ---------------------------------------------------
+    def connect(self) -> P.StickInfo:
+        """Initialise the stick; returns network info. Call this first."""
+        r = self.request(Msg.STICK_INIT, reply_id=Msg.STICK_INIT_REPLY, retries=0)
+        self.info_cache = P.decode_stick_init(r.payload)
+        return self.info_cache
+
+    @property
+    def circle_plus(self) -> str:
+        if self.info_cache is None:
+            self.connect()
+        if not self.info_cache.network_online:
+            raise PlugwiseError("Plugwise network is offline (no Circle+ paired)")
+        return self.info_cache.circle_plus_mac
+
+    def table(self) -> list[tuple[int, str]]:
+        """Nodes registered in the Circle+ table as (slot, mac)."""
+        cp = self.circle_plus
+        nodes = []
+        for slot in range(64):
+            r = self.request(Msg.TABLE_ENTRY, cp + f"{slot:02X}",
+                             reply_id=Msg.TABLE_ENTRY_REPLY)
+            _, mac = P.decode_table_entry(r.payload)
+            if mac:
+                nodes.append((slot, mac))
+        return nodes
+
+    def nodes(self) -> list[str]:
+        """All known node MACs: Circle+ first, then the table."""
+        return [self.circle_plus] + [m for _, m in self.table()]
+
+    def remove(self, mac: str) -> bool:
+        """Remove a node from the Circle+ table. Returns True on success."""
+        mac = norm_mac(mac)
+        if mac == self.circle_plus:
+            raise PlugwiseError("cannot remove the Circle+ from its own table")
+        r = self.request(Msg.NODE_REMOVE, self.circle_plus + mac,
+                         reply_id=Msg.NODE_REMOVE_REPLY)
+        removed_mac, ok = P.decode_node_remove(r.payload)
+        self._cal.pop(mac, None)
+        return ok and removed_mac == mac
+
+    # ---- joining -----------------------------------------------------------
+    def allow_joining(self, enable: bool) -> None:
+        self.request(Msg.ALLOW_JOINING, "01" if enable else "00",
+                     final_acks=(Ack.JOINING_ENABLED, Ack.JOINING_DISABLED,
+                                 Ack.SUCCESS), retries=0)
+
+    def accept(self, mac: str) -> None:
+        self.send(Msg.NODE_ACCEPT, "01" + norm_mac(mac))
+
+    def listen(self, seconds: float,
+               ids: set[str] | None = None) -> Iterator[P.Frame]:
+        """Yield unsolicited frames for `seconds` (optionally filtered)."""
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            with self._lock:
+                f = self.wait_for(lambda f: ids is None or f.id in ids, min(1.0, left))
+            if f:
+                yield f
+
+    def join(self, macs: list[str] | None = None, seconds: float = 120,
+             online_timeout: float = 180,
+             on_event: Callable[[str, str], None] = lambda ev, mac: None) -> list[str]:
+        """Open the network, accept announcing nodes (only `macs` if given),
+        and wait until each accepted node answers. Returns joined MACs.
+        on_event(event, mac) gets 'announced', 'accepted', 'online', 'no-response'.
+        """
+        want = {norm_mac(m) for m in macs or []}
+        joined = []
+        self.allow_joining(True)
+        try:
+            for f in self.listen(seconds, ids={Msg.NODE_ANNOUNCE}):
+                mac = f.payload[:16]
+                on_event("announced", mac)
+                if want and mac not in want:
+                    continue
+                self.accept(mac)
+                on_event("accepted", mac)
+                # keep joining open while the node associates (can take minutes)
+                deadline = time.monotonic() + online_timeout
+                while time.monotonic() < deadline:
+                    time.sleep(5)
+                    try:
+                        self.ping(mac, retries=0)
+                        on_event("online", mac)
+                        joined.append(mac)
+                        break
+                    except NodeTimeout:
+                        pass
+                else:
+                    on_event("no-response", mac)
+                want.discard(mac)
+                if macs and not want:
+                    break
+        finally:
+            self.allow_joining(False)
+        return joined
+
+    # ---- per node ----------------------------------------------------------
+    def ping(self, mac: str, *, retries: int | None = None) -> P.PingResult:
+        r = self.request(Msg.PING, norm_mac(mac), Msg.PING_REPLY, retries=retries)
+        return P.decode_ping(r.payload)
+
+    def info(self, mac: str, *, retries: int | None = None) -> P.NodeInfo:
+        r = self.request(Msg.INFO, norm_mac(mac), Msg.INFO_REPLY, retries=retries)
+        return P.decode_node_info(r.payload)
+
+    def calibration(self, mac: str, *, refresh: bool = False,
+                    retries: int | None = None) -> P.Calibration:
+        mac = norm_mac(mac)
+        if refresh or mac not in self._cal:
+            r = self.request(Msg.CALIBRATION, mac, Msg.CALIBRATION_REPLY,
+                             retries=retries)
+            self._cal[mac] = P.decode_calibration(r.payload)
+        return self._cal[mac]
+
+    def power(self, mac: str, *, retries: int | None = None) -> P.PowerReading:
+        mac = norm_mac(mac)
+        cal = self.calibration(mac, retries=retries)
+        r = self.request(Msg.POWER, mac, Msg.POWER_REPLY, retries=retries)
+        return P.decode_power(r.payload, cal)
+
+    def switch(self, mac: str, on: bool, *, retries: int | None = None) -> bool:
+        """Switch the relay; returns the new relay state reported by the node."""
+        r = self.request(Msg.RELAY, norm_mac(mac) + ("01" if on else "00"),
+                         final_acks=(Ack.RELAY_ON, Ack.RELAY_OFF), retries=retries)
+        return r.payload[:4] == Ack.RELAY_ON
+
+    # ---- clocks ------------------------------------------------------------
+    def get_clock(self, mac: str, *, retries: int | None = None) -> P.NodeClock:
+        r = self.request(Msg.CLOCK_GET, norm_mac(mac), Msg.CLOCK_REPLY,
+                         retries=retries)
+        return P.decode_node_clock(r.payload)
+
+    def set_clock(self, mac: str, dt: datetime | None = None, *,
+                  retries: int | None = None) -> None:
+        """Set a Circle's clock (default: now, UTC). Energy logs are kept."""
+        dt = dt or datetime.now(timezone.utc)
+        self.request(Msg.CLOCK_SET, P.encode_clock_set(mac, dt),
+                     final_acks=(Ack.CLOCK_SET,), retries=retries)
+
+    def get_rtc(self) -> P.RealTimeClock:
+        """Read the Circle+ real-time clock (used for its schedules)."""
+        r = self.request(Msg.RTC_GET, self.circle_plus, Msg.RTC_REPLY)
+        return P.decode_rtc(r.payload)
+
+    def set_rtc(self, dt: datetime | None = None) -> None:
+        dt = dt or datetime.now(timezone.utc)
+        self.request(Msg.RTC_SET, P.encode_rtc_set(self.circle_plus, dt),
+                     final_acks=(Ack.RTC_SET,))
+
+    def sync_clocks(self, macs: list[str] | None = None) -> dict[str, str | None]:
+        """Set all node clocks + the Circle+ RTC to now (UTC).
+        Returns {mac: None on success, or error text}."""
+        result: dict[str, str | None] = {}
+        for mac in macs or self.nodes():
+            try:
+                self.set_clock(mac, retries=1)
+                result[mac] = None
+            except PlugwiseError as e:
+                result[mac] = str(e)
+        if macs is None or self.circle_plus in macs:
+            try:
+                self.set_rtc()
+            except PlugwiseError as e:
+                result[self.circle_plus + " (rtc)"] = str(e)
+        return result
+
+    # ---- overview ----------------------------------------------------------
+    def status(self, macs: list[str] | None = None) -> list[NodeStatus]:
+        """Online/relay/power summary for all (or the given) nodes.
+        Offline nodes are tried only once, to keep this fast."""
+        slots = {}
+        if macs is None:
+            table = self.table()
+            slots = {m: s for s, m in table}
+            macs = [self.circle_plus] + [m for _, m in table]
+        out = []
+        for mac in map(norm_mac, macs):
+            st = NodeStatus(mac=mac, slot=slots.get(mac), online=False)
+            try:
+                inf = self.info(mac, retries=1)
+                st.online, st.node_type = True, inf.node_type
+                st.relay_on, st.clock = inf.relay_on, inf.clock
+                st.watts = self.power(mac, retries=1).watts_8s
+            except PlugwiseError as e:
+                st.error = str(e)
+            out.append(st)
+        return out
